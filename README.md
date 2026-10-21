@@ -269,12 +269,17 @@ straight-down key light: tilted directional shadows showed acne rings on the flo
 overlap the top by 2 mm and stop 1 mm above the floor, so no faces are coplanar (no z-fighting).
 MSAA is driver-dependent; software Mesa ignores it. So `VideoRecorder` also supersamples 2×
 (renders 4× the pixels and box-filters down), which works everywhere. Videos are H.264 crf 14
-yuv420p.
+yuv420p. The main view tracks the base in a wide shot. When manipulation starts,
+`VideoRecorder.close_on(point)` blends over 1 s of sim time to a low close-up from across
+the table, so the cube in the claw, the gap and its shadow below it, and the placement are all
+visible.
 
 ### Performance
 On a GPU with EGL, rendering is cheap. On the software-GL dev box it was about 0.6 s per
 supersampled 1200×720 video frame, so recording ran roughly 10–15× slower than realtime. Physics at 500 Hz
-(dt 0.002) is not the bottleneck.
+(dt 0.002) is not the bottleneck. For this reason the example guards (`move_lift`,
+`drive_to_standoff`) and the policy runner tick on the sim clock; the SDK's wall-clock
+`pose()`/`action()` waits get a generous timeout in `sim_pick_place.py`.
 
 ## Regenerating the model
 
