@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "nori-a3-mujoco"
+version = "0.1.0"
+description = "MuJoCo simulation of the Nori A3 behind the Nori Python SDK's session API, plus a fixed-rate policy runner."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+license = "Apache-2.0"
+license-files = ["LICENSE", "src/nori_a3_mujoco/assets/UPSTREAM_LICENSE"]
+# Versions are the ones this repo was developed and tested against (uv.lock pins the rest).
+dependencies = [
+  "nori-sdk==1.1.0",
+  "mujoco==3.16.0",
+  "numpy>=2.0",
+]
+
+[project.optional-dependencies]
+video = ["imageio==2.38.1", "imageio-ffmpeg==0.6.0", "pillow>=10"]
+gym = ["gymnasium==1.4.0"]
+build = ["xacro==2.1.1", "pyyaml>=6"]
+# Torch for policy inference. Pick exactly one: `cpu` or `xpu` (Intel Arc / oneAPI).
+cpu = ["torch==2.9.1"]
+xpu = ["torch==2.9.1", "pytorch-triton-xpu==3.5.0"]
+
+[dependency-groups]
+dev = ["pytest==9.1.1", "pytest-asyncio==1.4.0"]
+
+[tool.uv]
+conflicts = [[{ extra = "cpu" }, { extra = "xpu" }]]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-xpu"
+url = "https://download.pytorch.org/whl/xpu"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+  { index = "pytorch-cpu", extra = "cpu" },
+  { index = "pytorch-xpu", extra = "xpu" },
+]
+pytorch-triton-xpu = [{ index = "pytorch-xpu", extra = "xpu" }]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/nori_a3_mujoco"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
