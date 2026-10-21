@@ -184,6 +184,9 @@ async def main() -> int:
                 recorder.caption = text
                 if holder:
                     marks.setdefault(holder[0].phase, len(recorder.frames))
+                    if holder[0].phase == "open":  # manipulation starts: close-up shot
+                        mid = (bot.data.body("cube").xpos + bot.data.geom("place_marker").xpos) / 2
+                        recorder.close_on([mid[0] - 0.03, mid[1], 0.85])
 
         locator = None
         if args.backend == "sim":

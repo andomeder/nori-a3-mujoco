@@ -43,18 +43,49 @@ class VideoRecorder:
         self._free.distance = 1.9
         self._free.azimuth = -125.0
         self._free.elevation = -22.0
+        # Optional close-up: set `close_on(lookat)` to blend (over `blend_s` of sim time) from
+        # the base-tracking wide shot to a low shot from across the table, looking back at the
+        # claw, so the grasp, the gap under the lifted cube and the placement are visible.
+        self.close_view = {"distance": 0.65, "azimuth": 150.0, "elevation": -8.0}
+        self.blend_s = 1.0
+        self._close_lookat: np.ndarray | None = None
+        self._w = 0.0
+        self._target_w = 0.0
         robot.step_callbacks.append(self._on_step)
+
+    def close_on(self, lookat: Any) -> None:
+        """Blend to the close-up shot centred on world point `lookat`."""
+        self._close_lookat = np.asarray(lookat, dtype=float)
+        self._target_w = 1.0
+
+    def wide(self) -> None:
+        """Blend back to the wide, base-tracking shot."""
+        self._target_w = 0.0
 
     def _on_step(self, robot: Any) -> None:
         if robot.sim_time + 1e-9 >= self._next_t:
             self._next_t += 1.0 / self.fps
+            step = 1.0 / (self.fps * max(self.blend_s, 1e-6))
+            self._w = float(np.clip(self._w + np.clip(self._target_w - self._w, -step, step),
+                                    0.0, 1.0))
             self.frames.append(self.render())
 
     def render(self) -> np.ndarray:
         data = self.robot.data
         if self.track_base:
             x, y, _ = self.robot.base_pose()
-            self._free.lookat[:] = [x + 0.3, y + 0.08, 0.75]
+            wide_look = np.array([x + 0.3, y + 0.08, 0.75])
+            wide = {"distance": 1.9, "azimuth": -125.0, "elevation": -22.0}
+            w = self._w if self._close_lookat is not None else 0.0
+            w = w * w * (3 - 2 * w)  # smoothstep
+            look = wide_look if w == 0 else (1 - w) * wide_look + w * self._close_lookat
+            self._free.lookat[:] = look
+            # Azimuth: -125 -> 150 is shortest via 180 (-125 == 235).
+            az0, az1 = wide["azimuth"] % 360, self.close_view["azimuth"] % 360
+            d_az = (az1 - az0 + 180) % 360 - 180
+            self._free.azimuth = az0 + w * d_az
+            for key in ("distance", "elevation"):
+                setattr(self._free, key, (1 - w) * wide[key] + w * self.close_view[key])
             main = self._main.render(data, self._free)
         else:
             main = self._main.render(data, self.camera)

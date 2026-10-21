@@ -74,9 +74,18 @@ async def run(robot, bot: MujocoRobot | None = None, say=print) -> bool:
 
     say("estop")
     robot.estop()
-    await asyncio.sleep(0.3)
+    for _ in range(100):  # telemetry catches up within a few ticks (more when recording)
+        await asyncio.sleep(0.1)
+        if robot.telemetry.safety == "latched":
+            break
     print(f"estopped -- latched={robot.telemetry.safety}")
     return report.ok
+
+
+def close_up_point(bot: MujocoRobot):
+    """World point between the cube and the marker, for the recorder's close-up shot."""
+    mid = (bot.data.body("cube").xpos + bot.data.geom("place_marker").xpos) / 2
+    return [mid[0] - 0.03, mid[1], 0.85]
 
 
 async def main() -> int:
@@ -99,6 +108,8 @@ async def main() -> int:
         if recorder is not None:
             recorder.caption = text
             marks.setdefault(text, len(recorder.frames))
+            if text == CAPTIONS["open"]:
+                recorder.close_on(close_up_point(bot))
 
     async with mujoco_session(bot) as robot:
         ok = await run(robot, bot, say)
