@@ -42,6 +42,8 @@ ARM_MAX_SPEED = 2.0
 # An action is "reached" when every target is within this many wire units...
 ACTION_TOL = 2.0          # norm units (= 1% of range); lift: mm
 # ...and it is "settled somewhere else" (-> clamped) when joints stop moving for this long.
+WHEEL_HOLD_GAIN = 50.0   # 1/s: idle-base wheel position hold (velocity servo outer loop)
+POSE_TOL = 0.5           # norm units: a Cartesian pose must actually arrive (~2 mm at the claw)
 SETTLE_S = 0.4
 SETTLE_SPEED = 0.02       # rad/s (or m/s)
 ACTION_DEADLINE_S = 8.0   # robot-side per-action deadline -> "timeout"
@@ -94,9 +96,18 @@ class MujocoRobot(MockRobot):
         self._qadr = {k: int(self.model.joint(m.joint).qposadr[0]) for k, m in self.maps.items()}
         self._dadr = {k: int(self.model.joint(m.joint).dofadr[0]) for k, m in self.maps.items()}
         self._wheel_act = (self.model.actuator("left_wheel").id, self.model.actuator("right_wheel").id)
+        self._wheel_qadr = tuple(int(self.model.joint(f"{side}_wheel_joint").qposadr[0])
+                                 for side in ("left", "right"))
+        self._wheel_hold: list[float] | None = None
         self._base_body = self.model.body("base_footprint").id
         self._base_cmd = (0.0, 0.0)
         self._ctrl_target: dict[str, float] = {}
+        # Motion groups for coordinated slewing: each arm (7 joints), each gripper, the lift.
+        arms = {side: [k for k in self.maps if k.startswith(f"{side}_arm_")
+                       and not k.endswith("gripper.pos")] for side in ("left", "right")}
+        self._groups = [g for g in arms.values() if g]
+        self._groups += [[k] for k in self.maps if k.endswith("gripper.pos")]
+        self._groups += [[k] for k in self.maps if self.maps[k].kind == "lift"]
         self._pending: dict[str, dict[str, Any]] = {}
         self._was_estopped = False
         self._was_watchdog_stop = False
@@ -179,26 +190,44 @@ class MujocoRobot(MockRobot):
             lin, ang = self.pose.get("x.vel", 0.0), self.pose.get("theta.vel", 0.0)
         self._base_cmd = (lin, ang)
         wl, wr = units.wheel_speeds(lin, ang)
-        self.data.ctrl[self._wheel_act[0]] = wl
-        self.data.ctrl[self._wheel_act[1]] = wr
+        idle = abs(lin) < 1e-6 and abs(ang) < 1e-6
+        if idle and self._wheel_hold is None:
+            self._wheel_hold = [float(self.data.qpos[a]) for a in self._wheel_qadr]
+        elif not idle:
+            self._wheel_hold = None
 
         h = self.model.opt.timestep
         n = max(1, int(round(dt / h)))
         frozen = self.estopped or not self.online
+        lim = ARM_MAX_SPEED * h
         for _ in range(n):
-            for key, jm in self.maps.items():
-                if key not in self.pose:
-                    continue
-                if not frozen:
-                    goal = jm.to_sim(self.pose[key])
-                    cur = self._ctrl_target.get(key, goal)
-                    if jm.kind == "lift":
-                        nxt = goal  # lift rate is already limited by the jog integration
-                    else:
-                        lim = ARM_MAX_SPEED * h
-                        nxt = cur + max(-lim, min(lim, goal - cur))
-                    self._ctrl_target[key] = nxt
-                self.data.ctrl[self._act[key]] = self._ctrl_target[key]
+            if not frozen:
+                # Each arm moves COORDINATED: all 7 joints start and finish together (straight
+                # line in joint space, ~straight in Cartesian space over short moves) with the
+                # slowest joint at ARM_MAX_SPEED. Independent per-joint slewing would curve
+                # the path and sweep the claw sideways into whatever it is approaching.
+                for group in self._groups:
+                    deltas = {}
+                    for key in group:
+                        if key in self.pose:
+                            goal = self.maps[key].to_sim(self.pose[key])
+                            deltas[key] = goal - self._ctrl_target.get(key, goal)
+                    if not deltas:
+                        continue
+                    scale = max(1.0, max(abs(v) for v in deltas.values()) / lim)
+                    for key, delta in deltas.items():
+                        self._ctrl_target[key] = self._ctrl_target.get(key, 0.0) + delta / scale
+            for key in self.maps:
+                if key in self.pose:
+                    self.data.ctrl[self._act[key]] = self._ctrl_target[key]
+            for i, (act, qa) in enumerate(zip(self._wheel_act, self._wheel_qadr)):
+                if self._wheel_hold is None:
+                    self.data.ctrl[act] = (wl, wr)[i]
+                else:
+                    # Idle base: the drive holds wheel position (motor brake), so arm
+                    # reaction torques can't yaw the base on its frictionless casters.
+                    err = self._wheel_hold[i] - float(self.data.qpos[qa])
+                    self.data.ctrl[act] = max(-20.0, min(20.0, WHEEL_HOLD_GAIN * err))
             mujoco.mj_step(self.model, self.data)
 
         self._check_actions()
@@ -264,7 +293,8 @@ class MujocoRobot(MockRobot):
                 or (orientation is not None and (not isinstance(orientation, list)
                                                  or len(orientation) != 4))):
             return [self._status(action_id, "blocked", "bad_pose")] if action_id else []
-        result = ik.solve(self.model, self.data, side, position, orientation)
+        result = ik.solve(self.model, self.data, side, position, orientation, pos_tol=0.002,
+                          rot_tol=0.03)
         if not result.ok:
             return [self._status(action_id, "blocked", "no_ik_solution")] if action_id else []
         keys = []
@@ -276,7 +306,7 @@ class MujocoRobot(MockRobot):
             return []
         self._pending[action_id] = {"targets": {k: self.pose[k] for k in keys},
                                     "clamped": False, "started": self.sim_time,
-                                    "still_since": None}
+                                    "still_since": None, "tol": POSE_TOL}
         return [self._status(action_id, "accepted"), self._status(action_id, "active")]
 
     def _finish(self, action_id: str, state: str, reason: str | None = None) -> None:
@@ -296,11 +326,12 @@ class MujocoRobot(MockRobot):
         for action_id, pend in list(self._pending.items()):
             targets = pend["targets"]
             # A newer action on the same key supersedes the target we are waiting on.
-            reached = all(abs(self.measured(k) - targets[k]) <= ACTION_TOL for k in targets)
+            tol = pend.get("tol", ACTION_TOL)
+            reached = all(abs(self.measured(k) - targets[k]) <= tol for k in targets)
             moving = any(abs(self.data.qvel[self._dadr[k]]) > SETTLE_SPEED for k in targets)
             ramping = any(abs(self._ctrl_target[k] - self.maps[k].to_sim(targets[k])) > 1e-4
                           for k in targets)
-            if reached and not moving:
+            if reached and not moving and not ramping:
                 self._finish(action_id, "clamped" if pend["clamped"] else self.action_outcome)
                 continue
             if not moving and not ramping:

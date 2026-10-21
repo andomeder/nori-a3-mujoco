@@ -12,7 +12,7 @@ OUT ?= videos
 -include .env
 export
 
-.PHONY: help setup setup-xpu build-model test example policy policy-demo demo view view-policy gpu-info requirements clean
+.PHONY: help setup setup-xpu build-model test example sdk-example policy policy-demo demo view view-policy gpu-info requirements clean
 
 help: ## list targets
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN{FS=":.*?## "}{printf "  \033[36m%-14s\033[0m %s\n",$$1,$$2}'
@@ -30,19 +30,22 @@ build-model: ## regenerate assets/a3.xml + meshes from a nori_description checko
 test: ## run the test suite (headless)
 	$(RUN) python -m pytest -q
 
-example: ## SDK's mock_pick_place.py against the sim (session constructor swapped)
+example: ## real pick-and-place through the SDK API (camera, IK, gripper)
 	$(RUN) python examples/sim_pick_place.py
+
+sdk-example: ## the SDK's mock_pick_place.py against the sim, only the session line swapped
+	$(RUN) python examples/sdk_mock_pick_place.py
 
 policy: ## scripted policy through run_policy (headless, prints a report)
 	$(RUN) python examples/scripted_policy.py
 
 policy-demo: ## scripted policy, recorded to $(OUT)/scripted_policy.mp4
 	@mkdir -p $(OUT)
-	$(RUN) python examples/scripted_policy.py --record $(OUT)/scripted_policy.mp4
+	$(RUN) python examples/scripted_policy.py --record $(OUT)/scripted_policy.mp4 --stills $(OUT)/stills_policy
 
-demo: ## render the showcase video + stills to $(OUT)/ (offscreen EGL)
+demo: ## pick-and-place video + stills to $(OUT)/ (offscreen EGL)
 	@mkdir -p $(OUT)
-	$(RUN) python examples/render_demo.py --out $(OUT)/demo.mp4 --stills $(OUT)/stills
+	$(RUN) python examples/sim_pick_place.py --record $(OUT)/demo.mp4 --stills $(OUT)/stills
 
 view: ## interactive MuJoCo viewer on the scene (GLFW window, drag joints with the mouse)
 	MUJOCO_GL=glfw $(RUN) python -m mujoco.viewer --mjcf=src/nori_a3_mujoco/assets/scene.xml

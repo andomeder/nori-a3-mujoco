@@ -27,7 +27,8 @@ async with mujoco_session(MujocoRobot()) as robot:     # was: async with mock_se
 | Torch action-chunk (ACT-style) policy adapter, device selection (CUDA/XPU/CPU) | `torch_policy.py`, `devices.py` |
 | Gymnasium wrapper (optional) | `src/nori_a3_mujoco/gym_env.py` |
 | Video recorder (main view and 4 camera tiles, captions) | `src/nori_a3_mujoco/record.py` |
-| Examples | `examples/sim_pick_place.py` (the SDK's `mock_pick_place.py`, 2 lines changed), `scripted_policy.py`, `torch_policy.py`, `render_demo.py` |
+| Grasp calibration, camera-based cube/marker localisation, pick-and-place routine | `grasp.py`, `perception.py`, `pick_place.py` |
+| Examples | `examples/sim_pick_place.py` (real pick-and-place over the SDK API), `sdk_mock_pick_place.py` (the SDK's `mock_pick_place.py`, 2 lines changed), `scripted_policy.py`, `torch_policy.py` |
 
 ## Setup (Arch Linux, terminal)
 
@@ -42,7 +43,7 @@ sudo pacman -S --needed intel-compute-runtime level-zero-loader
 
 make setup            # .venv from uv.lock: mujoco, nori-sdk, video, gym, xacro, CPU torch
 make setup-xpu        # same, but torch 2.9.1+xpu from download.pytorch.org/whl/xpu
-make test             # 33 tests, headless
+make test             # 40 tests, headless (~1.5 min)
 make help             # all targets
 ```
 
@@ -63,10 +64,11 @@ pip install -e . --no-deps
 
 | | command | display? |
 |---|---|---|
-| SDK example against the sim | `make example` | no (EGL) |
+| Pick-and-place over the SDK API | `make example` | no (EGL) |
+| The SDK's own example, session line swapped | `make sdk-example` | no |
 | Scripted policy through `run_policy` | `make policy` | no |
 | Same, recorded to `videos/scripted_policy.mp4` | `make policy-demo` | no |
-| Showcase video and stills → `videos/` | `make demo` | no |
+| Pick-and-place video and stills → `videos/` | `make demo` | no |
 | Torch ACT-style policy on auto device | `uv run python examples/torch_policy.py` (`--bench 200` for inference only) | no |
 | Interactive viewer, static scene (drag joints, inspect) | `make view` | yes |
 | Interactive viewer while a policy runs | `make view-policy` | yes |
@@ -76,7 +78,7 @@ pip install -e . --no-deps
 the package default. `MUJOCO_GL=osmesa` is a pure-software fallback.
 For a live window, set `NORI_VIEWER=1`. Any `mujoco_session()` then opens MuJoCo's passive
 viewer (GLFW) and syncs it at about 60 Hz. This covers the unchanged SDK example too:
-`NORI_VIEWER=1 MUJOCO_GL=glfw uv run python examples/sim_pick_place.py`.
+`NORI_VIEWER=1 MUJOCO_GL=glfw uv run python examples/sdk_mock_pick_place.py`.
 You can also pass `mujoco_session(..., viewer=True)`.
 
 ## Using the sim from SDK code
@@ -142,10 +144,12 @@ print(report)   # steps, achieved_hz, overruns, latency, safe_hold_ticks, reason
   sim pump. Put heavy compute in an `async` policy that uses `asyncio.to_thread`, as
   `ChunkedTorchPolicy` does.
 
-**Scripted example** (`examples/scripted_policy.py`): drive until the red cube fills enough of
-the *front camera*, then reach beside it with `pose()`, close the gripper, raise the lift, back
-off. The same policy object runs with `--backend mock`, where a timer replaces the camera.
-It does **not** grasp the cube (see below).
+**Scripted example** (`examples/scripted_policy.py`): a phase machine ticked by `run_policy`
+at 10 Hz that does the full pick-and-place: lift to table height, drive until the *overhead
+camera* puts the cube in reach, locate cube and marker, then pre-grasp → approach → close →
+lift → carry → lower → release → retreat, all through `pose()`/`action`/jog outputs. The
+same policy object runs with `--backend mock` (a timer and the nominal layout replace the
+camera; the mock has no physics, so nothing is actually picked there).
 
 **Gym** (`nori_a3_mujoco.gym_env.NoriA3Env`): a 19-D action (16 joints, lift mm, base
 linear/angular) and a Dict observation (`state` plus `images/<role>`). It steps the sim
@@ -189,16 +193,19 @@ Rendering uses the GPU through EGL/mesa.
   (measured 0.499) and that the idler finger counter-rotates.
 - Actuator names, joint names and units, camera roles, telemetry keys, action lifecycle, estop
   latch and watchdog profiles follow the SDK's `A3_DESCRIPTOR` and `MockRobot`.
-- `examples/sim_pick_place.py` is the SDK's `mock_pick_place.py` byte-for-byte except two
-  lines. A test enforces this.
+- `examples/sdk_mock_pick_place.py` is the SDK's `mock_pick_place.py` byte-for-byte except
+  two lines. A test enforces this.
 
 **Approximate or assumed (treat as placeholders)**
 - **Mass/inertia.** Upstream masses are measured but sum to about 18.3 kg against a 20.5 kg
   real robot (about 9% light, per upstream NOTICE). They are not rescaled here. Inertias are
   upstream approximations, with `balanceinertia` enabled.
-- **Servo strength and gains.** These are position actuators with kp=100 and kv=2. Per-joint
-  torque limits (9.3/9.3/4.9/9.3/4.9/2.9/2.9/2.9 N·m from shoulder to gripper) are a
-  guessed servo-grade allocation. Arm targets are slew-limited to 2 rad/s. The lift is a
+- **Servo strength and gains.** These are position actuators with kp=300 and kv=4 (a few mm
+  of gravity sag at full reach). Per-joint torque limits (9.3/9.3/4.9/9.3/4.9/2.9/2.9/2.9
+  N·m from shoulder to gripper) are a guessed servo-grade allocation. Arm targets move
+  *coordinated* (all 7 joints of an arm start and stop together, slowest at 2 rad/s), which
+  keeps short `pose()` moves close to straight lines. `pose()` reports `done` only within
+  0.5 units of the IK solution, `action` within 2 units. The lift is a
   stiff position servo (kp 4e4, 400 N). Lift jog runs at 50 mm/s, matching the SDK mock;
   the docs say 30 mm/s.
 - **Unit calibration.** SDK `range_m100_100` units (and gripper 0–100) map *linearly* onto the
@@ -206,27 +213,67 @@ Rendering uses the GPU through EGL/mesa.
   are unknown.
 - **Base.** Wheel radius 0.0762 m and track 0.30 m. Max speeds 0.5 m/s and 1.5 rad/s are
   assumptions. Wheels are velocity servos (6 N·m). The URDF's fixed casters are modelled as
-  frictionless contacts. Forward speed reaches about 0.39 of a commanded 0.4 m/s.
+  frictionless contacts, so when the base is idle the drive holds wheel position (a brake);
+  without it, arm reaction torques yawed the base by up to 0.1 rad during a reach. Forward
+  speed reaches about 0.39 of a commanded 0.4 m/s.
   `x.vel`/`theta.vel` telemetry is measured and normalised by those max speeds.
 - **Lift range.** The descriptor allows 0–720 mm. The model clamps at the 700 mm operating
   ceiling from the upstream NOTICE.
 - **Cameras.** Mount poses are upstream (and marked unverified upstream). FOV (58°) and
   resolution are guesses. Using the URDF optical frames as given, the `left_wrist` image comes
   out upside-down relative to `right_wrist`. This was kept as-is rather than "fixed".
-- **Contacts.** Collision uses upstream primitive shapes. Robot self-collision is off.
+- **Contacts.** Collision uses upstream primitive shapes (hidden, group 3), except the claw
+  fingers (below). Robot self-collision is off.
 - **Not simulated** (mock behaviour inherited from `MockRobot`): navigation goals, recording /
   episodes, `policy_stream`.
 
 ### Grasping
-The sim does **not** pick objects up. With the upstream collision primitives, the closed
-fingers don't make contact with a cube placed at the TCP site, and the TCP site may not be
-the real grasp point. The demos show reach plus gripper open/close, not a pick. Fixing this
-needs better finger collision geometry (and probably a calibrated TCP). That's the first
-thing to improve before any grasp-learning work.
+The sim picks the cube up for real: it is lifted ~8 cm off the table, carried 15 cm, and set
+down on the marker by friction alone (no welds, no attachment constraints). To get there:
+
+- **Finger collision.** Upstream gives each claw finger one solid box that fills the whole
+  jaw, so nothing could sit between the fingers. `build_model.py` replaces it with three
+  boxes per finger that trace the C-shaped jaw of the visual mesh (measured by ray-casting
+  the STL): an outer arm, a flat inner pad, and an inward tip hook. Pads use condim 4
+  (torsional friction), friction 1.5, solref 0.004, a 1 mm margin, and priority over the cube.
+  Closed, the pads leave a 37 mm gap.
+- **Cube.** 40 mm, 50 g (a wooden block), condim 4. It is squeezed at about 0.06 rad of finger
+  opening, where the 2.9 N·m gripper servo saturates (~50 N per pad).
+- **Grasp point / TCP.** The URDF TCP sits at the closed fingertips. Objects are held in the
+  jaw cavity, 24 mm further back along the approach (14 mm off-centre across the finger
+  plate). That is the `{side}_grasp` site, with the constant in `grasp.GRASP_IN_TCP`.
+  `pose()` keeps the SDK meaning (URDF TCP); `grasp.tcp_for_grasp()` converts.
+- **Grasp.** A horizontal side grasp with the left claw (approach along base +x, the claw's
+  hub and camera on top), at the cube's top-face height. The wrist housing reaches 37 mm
+  below the grasp point and would otherwise drag on the table.
+- **Perception.** The cube and the green marker come from the *overhead camera*: colour blob
+  → pixel ray (intrinsics from the MJCF fovy, extrinsics from the robot's own kinematics at
+  the measured lift height) → plane at the known table height. Error against ground truth
+  is ≤ 3 mm in x and ≤ 8 mm in y. The only scene prior is the table height.
+
+Verified from sim state (`tests/test_grasp.py`, 3 start poses including ±15–20° cube yaw, and
+6 more by hand):
+- Peak height is 0.859–0.866 m, against 0.780 resting.
+- During carry the cube stays within ~1.8 cm of the grasp point, constant to <1 mm.
+- It ends upright at z = 0.780, 6–8 mm from the marker centre. The hooks pull the cube about
+  8 mm into the jaw when closing, which shows up as that placement offset.
+
+Limits: one grasp (left claw, side approach) in a reach window of roughly x 0.32–0.36 m,
+y 0.08–0.20 m ahead of the base at lift 300 mm. The pad geometry, friction and gripper force
+are ours, not measured from the hardware.
+
+### Rendering
+`scene.xml` asks for 8× MSAA (`offsamples`) and a 4096 shadow map clipped to the work area.
+It uses a tight near/far range (`znear 0.02`, `zfar 15`, relative to the model extent) and a
+straight-down key light: tilted directional shadows showed acne rings on the floor. Table legs
+overlap the top by 2 mm and stop 1 mm above the floor, so no faces are coplanar (no z-fighting).
+MSAA is driver-dependent; software Mesa ignores it. So `VideoRecorder` also supersamples 2×
+(renders 4× the pixels and box-filters down), which works everywhere. Videos are H.264 crf 14
+yuv420p.
 
 ### Performance
-On a GPU with EGL, rendering is cheap. On the software-GL dev box it was about 30 ms per
-320×240 camera tile, and video recording ran about 6× slower than realtime. Physics at 500 Hz
+On a GPU with EGL, rendering is cheap. On the software-GL dev box it was about 0.6 s per
+supersampled 1200×720 video frame, so recording ran roughly 10–15× slower than realtime. Physics at 500 Hz
 (dt 0.002) is not the bottleneck.
 
 ## Regenerating the model

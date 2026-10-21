@@ -23,7 +23,7 @@ class VideoRecorder:
     def __init__(self, robot: Any, *, fps: float = 30.0, width: int = 960, height: int = 720,
                  camera: str = "demo_wide", inset: bool = True,
                  roles: tuple[str, ...] = ("front", "overhead", "left_wrist", "right_wrist"),
-                 track_base: bool = True) -> None:
+                 track_base: bool = True, supersample: int = 2) -> None:
         self.robot = robot
         self.fps = fps
         self.width, self.height = width, height
@@ -34,13 +34,15 @@ class VideoRecorder:
         self.caption = ""
         self.frames: list[np.ndarray] = []
         self._next_t = robot.sim_time
-        self._main = CameraRenderer(robot.model, width, height, shadows=True)
+        self._main = CameraRenderer(robot.model, width, height, shadows=True,
+                                    supersample=supersample)
         th = height // len(roles)
-        self._tile = CameraRenderer(robot.model, int(th * 4 / 3), th) if inset else None
+        self._tile = CameraRenderer(robot.model, int(th * 4 / 3), th,
+                                    supersample=supersample) if inset else None
         self._free = mujoco.MjvCamera()
-        self._free.distance = 2.4
+        self._free.distance = 1.9
         self._free.azimuth = -125.0
-        self._free.elevation = -18.0
+        self._free.elevation = -22.0
         robot.step_callbacks.append(self._on_step)
 
     def _on_step(self, robot: Any) -> None:
@@ -52,7 +54,7 @@ class VideoRecorder:
         data = self.robot.data
         if self.track_base:
             x, y, _ = self.robot.base_pose()
-            self._free.lookat[:] = [x + 0.25, y, 0.7]
+            self._free.lookat[:] = [x + 0.3, y + 0.08, 0.75]
             main = self._main.render(data, self._free)
         else:
             main = self._main.render(data, self.camera)
@@ -109,10 +111,14 @@ class VideoRecorder:
 
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        imageio.mimwrite(path, self.frames, fps=self.fps, codec="libx264", quality=7,
-                         macro_block_size=8)
+        # High-quality H.264 (crf 14) in yuv420p so it plays everywhere.
+        imageio.mimwrite(path, self.frames, fps=self.fps, codec="libx264", quality=None,
+                         macro_block_size=8, pixelformat="yuv420p",
+                         output_params=["-crf", "14", "-preset", "slow", "-tune", "animation"])
         for name, index in (stills or {}).items():
-            imageio.imwrite(path.parent / name, self.frames[min(index, len(self.frames) - 1)])
+            out = path.parent / name
+            out.parent.mkdir(parents=True, exist_ok=True)
+            imageio.imwrite(out, self.frames[min(index, len(self.frames) - 1)])
         return path
 
     def close(self) -> None:

@@ -43,16 +43,28 @@ class CameraRenderer:
     """Renders named MuJoCo cameras. Create and use it on ONE thread (GL context affinity)."""
 
     def __init__(self, model: mujoco.MjModel, width: int = 320, height: int = 240,
-                 shadows: bool = False) -> None:
+                 shadows: bool = False, supersample: int = 1) -> None:
         self.model = model
         self.width, self.height = width, height
         self.shadows = shadows  # off by default: halves software-GL render time
-        self._renderer = mujoco.Renderer(model, height=height, width=width)
+        # Supersampling: render s x larger and box-filter down. Unlike MSAA (the model asks
+        # for offsamples=8) this works on every GL driver, including software Mesa, and
+        # also smooths shading/shadow-map aliasing, not just geometry edges.
+        self.ss = max(1, int(supersample))
+        w, h = width * self.ss, height * self.ss
+        vis = model.vis.global_
+        vis.offwidth, vis.offheight = max(vis.offwidth, w), max(vis.offheight, h)
+        self._renderer = mujoco.Renderer(model, height=h, width=w)
 
     def render(self, data: mujoco.MjData, camera: str | int | mujoco.MjvCamera) -> np.ndarray:
         self._renderer.update_scene(data, camera=camera)
         self._renderer.scene.flags[mujoco.mjtRndFlag.mjRND_SHADOW] = int(self.shadows)
-        return self._renderer.render().copy()
+        img = self._renderer.render()
+        if self.ss == 1:
+            return img.copy()
+        s = self.ss
+        img = img.reshape(self.height, s, self.width, s, 3).astype(np.float32).mean(axis=(1, 3))
+        return np.clip(img + 0.5, 0, 255).astype(np.uint8)
 
     def composite(self, data: mujoco.MjData, tiles: list[str], cols: int, rows: int) -> np.ndarray:
         out = np.zeros((rows * self.height, cols * self.width, 3), dtype=np.uint8)

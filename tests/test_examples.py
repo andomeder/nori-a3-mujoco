@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_sdk_example_runs_against_the_sim():
-    out = subprocess.run([sys.executable, str(ROOT / "examples" / "sim_pick_place.py")],
+    out = subprocess.run([sys.executable, str(ROOT / "examples" / "sdk_mock_pick_place.py")],
                          capture_output=True, text=True, timeout=120,
                          env={**os.environ, "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl")})
     assert out.returncode == 0, out.stderr
@@ -21,9 +21,21 @@ def test_example_differs_from_sdk_only_in_session_lines():
     if not sdk.exists():
         import pytest
         pytest.skip("nori-sdk-py checkout not beside this repo")
-    ours = [ln for ln in (ROOT / "examples" / "sim_pick_place.py").read_text().splitlines()
+    ours = [ln for ln in (ROOT / "examples" / "sdk_mock_pick_place.py").read_text().splitlines()
             if not ln.startswith("# ")]
     theirs = sdk.read_text().splitlines()
     diff = [(a, b) for a, b in zip(ours, theirs) if a != b]
     assert len(ours) == len(theirs)
     assert len(diff) == 2 and all("<- changed" in a for a, _ in diff)
+
+
+def test_sim_pick_place_example_really_places_the_cube():
+    out = subprocess.run([sys.executable, str(ROOT / "examples" / "sim_pick_place.py")],
+                         capture_output=True, text=True, timeout=300,
+                         env={**os.environ, "MUJOCO_GL": os.environ.get("MUJOCO_GL", "egl")})
+    assert out.returncode == 0, out.stdout + out.stderr
+    assert "ok=True" in out.stdout
+    line = next(ln for ln in out.stdout.splitlines() if ln.startswith("sim check:"))
+    mm = float(line.split(",")[1].split("mm")[0])
+    assert mm < 15.0, line
+    assert "estopped -- latched=latched" in out.stdout

@@ -3,34 +3,45 @@
   <include file="a3.xml"/>
 
   <statistic center="0.2 0 0.7" extent="1.6"/>
+  <!-- Rendering: 8x MSAA where the GL driver supports it (the recorder also supersamples,
+       which works everywhere), a 4096 shadow map clipped tight around the work area,
+       and a near/far range that keeps depth precision on the table (no z-fighting). -->
   <visual>
-    <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0"/>
-    <global azimuth="150" elevation="-20" offwidth="1280" offheight="720"/>
-    <quality shadowsize="2048"/>
+    <headlight diffuse="0.45 0.45 0.45" ambient="0.3 0.3 0.3" specular="0 0 0"/>
+    <global azimuth="150" elevation="-20" offwidth="2560" offheight="1600"/>
+    <quality shadowsize="4096" offsamples="8"/>
+    <map znear="0.02" zfar="15" shadowclip="1.2" shadowscale="0.5"/>
   </visual>
 
   <asset>
     <texture type="skybox" builtin="gradient" rgb1="0.55 0.65 0.75" rgb2="0.05 0.06 0.08" width="512" height="3072"/>
     <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.24 0.26 0.29" rgb2="0.18 0.2 0.22" markrgb="0.5 0.5 0.5" width="300" height="300"/>
-    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="4 4" reflectance="0.15"/>
+    <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="4 4" reflectance="0.05"/>
     <material name="table" rgba="0.62 0.5 0.38 1"/>
   </asset>
 
   <worldbody>
-    <light pos="0 0 3.5" dir="0 0 -1" directional="true" castshadow="true"/>
+    <!-- Straight-down key light: a tilted directional shadow map shows acne (moire rings)
+         on the floor with MuJoCo's fixed depth bias. -->
+    <light pos="0.6 0 3.5" dir="0 0 -1" directional="true" castshadow="true" diffuse="0.7 0.7 0.7"/>
     <light pos="2 -2 3" dir="-0.5 0.5 -1" diffuse="0.4 0.4 0.4" castshadow="false"/>
     <geom name="floor" size="0 0 0.05" type="plane" material="groundplane" contype="1" conaffinity="2" friction="1 0.01 0.001"/>
 
+    <!-- Table: legs overlap 2 mm into the top and stop 1 mm above the floor, so no two
+         faces are coplanar (coplanar faces z-fight / flicker in the render). -->
     <body name="table" pos="1.25 0 0">
       <geom name="table_top" type="box" size="0.3 0.4 0.02" pos="0 0 0.74" material="table" contype="1" conaffinity="3"/>
-      <geom type="box" size="0.02 0.02 0.36" pos="0.26 0.36 0.36" material="table" contype="1" conaffinity="3"/>
-      <geom type="box" size="0.02 0.02 0.36" pos="-0.26 0.36 0.36" material="table" contype="1" conaffinity="3"/>
-      <geom type="box" size="0.02 0.02 0.36" pos="0.26 -0.36 0.36" material="table" contype="1" conaffinity="3"/>
-      <geom type="box" size="0.02 0.02 0.36" pos="-0.26 -0.36 0.36" material="table" contype="1" conaffinity="3"/>
+      <geom type="box" size="0.02 0.02 0.3605" pos="0.26 0.36 0.3615" material="table" contype="1" conaffinity="3"/>
+      <geom type="box" size="0.02 0.02 0.3605" pos="-0.26 0.36 0.3615" material="table" contype="1" conaffinity="3"/>
+      <geom type="box" size="0.02 0.02 0.3605" pos="0.26 -0.36 0.3615" material="table" contype="1" conaffinity="3"/>
+      <geom type="box" size="0.02 0.02 0.3605" pos="-0.26 -0.36 0.3615" material="table" contype="1" conaffinity="3"/>
+      <!-- place target: visual only, 1.5 mm proud of the table top -->
+      <geom name="place_marker" type="cylinder" size="0.03 0.0005" pos="-0.25 0.27 0.7615" rgba="0.15 0.65 0.3 1" contype="0" conaffinity="0"/>
     </body>
-    <body name="cube" pos="1.0 0.12 0.785">
+    <!-- 40 mm, 50 g cube (a wooden block); fits the A3 claw (37 mm closed jaw gap). -->
+    <body name="cube" pos="1.0 0.12 0.781">
       <freejoint name="cube_free"/>
-      <geom name="cube" type="box" size="0.025 0.025 0.025" rgba="0.85 0.2 0.15 1" mass="0.08" contype="3" conaffinity="3" friction="1.2 0.01 0.001"/>
+      <geom name="cube" type="box" size="0.02 0.02 0.02" rgba="0.85 0.2 0.15 1" mass="0.05" contype="3" conaffinity="3" condim="4" friction="1.0 0.01 0.0005" solref="0.004 1" solimp="0.95 0.99 0.001"/>
     </body>
 
     <camera name="demo_wide" pos="2.4 -1.9 1.6" xyaxes="0.62 0.78 0 -0.3 0.24 0.92" fovy="45"/>

@@ -33,7 +33,12 @@ def solve(model: mujoco.MjModel, data: mujoco.MjData, side: str, position_m,
     if best.ok:
         return best
     rng = np.random.default_rng(7)
-    seeds = [0.0] + [rng.uniform(-1.2, 1.2, size=len(ARM_DOFS)) for _ in range(restarts)]
+    # 1) stay in the current arm "family": small perturbations of where the arm is now, so a
+    #    sequence of nearby targets gives a continuous motion instead of a flip;
+    # 2) only then the zero pose and wide pseudo-random seeds.
+    here = np.array([data.qpos[model.joint(f"{side}_{d}_joint").qposadr[0]] for d in ARM_DOFS])
+    seeds = [here + rng.normal(0.0, 0.15, size=len(ARM_DOFS)) for _ in range(6)]
+    seeds += [0.0] + [rng.uniform(-1.2, 1.2, size=len(ARM_DOFS)) for _ in range(restarts)]
     for seed in seeds:
         res = _solve(model, data, side, position_m, orientation_xyzw, seed=seed, **kw)
         if res.ok:

@@ -33,6 +33,7 @@ import tempfile
 from pathlib import Path
 
 import mujoco
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 ASSETS = ROOT / "src" / "nori_a3_mujoco" / "assets"
@@ -52,8 +53,8 @@ ARM_FORCE = {
     "shoulder_pitch": 9.3, "shoulder_roll": 9.3, "bicep_yaw": 4.9, "elbow_pitch": 9.3,
     "forearm_yaw": 4.9, "wrist_pitch": 2.9, "wrist_roll": 2.9, "gripper": 2.9,
 }
-ARM_KP = 100.0         # N*m/rad. Servo-like stiff position loop; not identified from hardware.
-ARM_KV = 2.0
+ARM_KP = 300.0         # N*m/rad. Stiff servo-like position loop (~6 mm sag at full reach); not identified from hardware.
+ARM_KV = 4.0
 ARM_ARMATURE = 0.01    # reflected rotor inertia stand-in; keeps light links stable at 2 ms
 LIFT_KP = 40000.0      # N/m. Stiff position hold; the real column drive is not modelled
 LIFT_FORCE = 400.0     # N. URDF says effort=1.0, which cannot lift ~8 kg; that is a ros2_control
@@ -61,6 +62,26 @@ LIFT_FORCE = 400.0     # N. URDF says effort=1.0, which cannot lift ~8 kg; that 
 WHEEL_KV = 2.0
 WHEEL_FORCE = 6.0      # N*m per wheel
 CAMERA_FOVY = 58.0     # deg. The U20CAM's FOV is not in the description; this is a guess.
+
+# --- gripper collision -----------------------------------------------------------------
+# Upstream gives each claw finger ONE solid box (0.034 x 0.058 x 0.104 m) that fills the jaw,
+# so nothing can sit between the fingers. Replace it with boxes that trace the C-shaped jaw of
+# the visual mesh: an outer arm, a flat inner wall (the pad) and an inward tip hook.
+# Measured by ray-casting the visual meshes, in the LEFT wrist_roll frame with the claw
+# closed (q=0), for the finger on the +x side; the idler finger mirrors about x = JAW_X and
+# the right arm mirrors in y. Closed, the walls leave a 37 mm gap: a 40 mm cube is squeezed.
+JAW_X = 0.0025            # closing plane of the two fingers (x, wrist_roll frame)
+JAW_Y, JAW_HALF_Y = 0.005, 0.018   # finger plate centre / half-height across the jaw
+FINGER_BOXES = (          # name, centre (x, z), half (x, z), angle about +y (rad)
+    ("arm",  (0.0290, -0.0580), (0.0050, 0.0180), 0.0),
+    ("pad",  (0.0232, -0.0875), (0.0047, 0.0115), 0.0),
+)
+HOOK_INNER = ((0.0185, -0.0990), (0.0030, -0.1130))   # inner face of the tip hook, (x, z)
+HOOK_HALF_T = 0.004
+GRASP_POINT = (JAW_X, JAW_Y, -0.088)   # centre of the jaw cavity (wrist_roll frame, left)
+PAD_FRICTION = [1.5, 0.02, 0.0005]     # rubber-ish pads; condim 4 adds torsional friction
+PAD_SOLREF = [0.004, 1.0]
+PAD_SOLIMP = [0.95, 0.99, 0.001, 0.5, 2.0]
 
 ROBOT_CONTYPE, ROBOT_CONAFF = 2, 1   # robot never collides with itself (see README)
 WORLD_CONTYPE, WORLD_CONAFF = 1, 2   # floor: collides with robot
@@ -113,6 +134,55 @@ def _damping(value: float):
         return [value, 0.0, 0.0]
 
 
+def _hook_box():
+    (x0, z0), (x1, z1) = HOOK_INNER
+    u = np.array([x1 - x0, z1 - z0])
+    length = float(np.linalg.norm(u))
+    u /= length
+    n = np.array([-u[1], u[0]])                    # in-plane normal
+    mid = np.array([(x0 + x1) / 2, (z0 + z1) / 2])
+    if np.dot(np.array([JAW_X, GRASP_POINT[2]]) - mid, n) < 0:
+        n = -n                                       # make n point into the cavity
+    c = mid - n * HOOK_HALF_T                        # inner face of the box on the line
+    angle = float(np.arctan2(-u[1], u[0]))           # rotation about +y maps x -> u
+    return ("hook", (float(c[0]), float(c[1])), (length / 2, HOOK_HALF_T), angle)
+
+
+def _finger_geoms(spec: mujoco.MjSpec, side: str) -> None:
+    """Swap the upstream finger boxes for jaw-shaped pads (see FINGER_BOXES)."""
+    ysign = 1.0 if side == "left" else -1.0
+    for finger, xmirror in (("gripper", False), ("gripper_idler", True)):
+        body = spec.body(f"{side}_{finger}_link")
+        for geom in list(body.geoms):
+            if not (geom.contype == 0 and geom.conaffinity == 0):
+                spec.delete(geom)
+        bpos = np.array(body.pos, dtype=float)
+        bmat = np.zeros(9)
+        mujoco.mju_quat2Mat(bmat, np.array(body.quat, dtype=float))
+        bmat = bmat.reshape(3, 3)
+        for name, (cx, cz), (hx, hz), angle in (*FINGER_BOXES, _hook_box()):
+            if xmirror:
+                cx, angle = 2 * JAW_X - cx, -angle
+            centre_wr = np.array([cx, ysign * JAW_Y, cz])
+            rot_wr = np.zeros(9)
+            q = np.array([np.cos(angle / 2), 0.0, np.sin(angle / 2), 0.0])
+            mujoco.mju_quat2Mat(rot_wr, q)
+            rot_body = bmat.T @ rot_wr.reshape(3, 3)
+            quat = np.zeros(4)
+            mujoco.mju_mat2Quat(quat, rot_body.flatten())
+            body.add_geom(
+                name=f"{side}_{finger}_{name}", type=mujoco.mjtGeom.mjGEOM_BOX,
+                size=[hx, JAW_HALF_Y, hz], pos=list(bmat.T @ (centre_wr - bpos)),
+                quat=list(quat), contype=ROBOT_CONTYPE, conaffinity=ROBOT_CONAFF,
+                condim=4, friction=PAD_FRICTION, solref=PAD_SOLREF, solimp=PAD_SOLIMP,
+                margin=0.001, gap=0.0, priority=2, group=3, rgba=[0.9, 0.5, 0.1, 0.5],
+                density=0.0)
+    wr = spec.body(f"{side}_wrist_roll_link")
+    gx, gy, gz = GRASP_POINT
+    wr.add_site(name=f"{side}_grasp", pos=[gx, ysign * gy, gz], quat=[0, -1, 0, 0],
+                size=[0.006, 0, 0], rgba=[0.1, 0.9, 0.2, 0.7], group=4)
+
+
 def edit_spec(spec: mujoco.MjSpec) -> None:
     spec.modelname = "nori_a3"
     spec.option.timestep = 0.002
@@ -128,6 +198,7 @@ def edit_spec(spec: mujoco.MjSpec) -> None:
         if geom.contype == 0 and geom.conaffinity == 0:
             continue  # visual
         geom.contype, geom.conaffinity = ROBOT_CONTYPE, ROBOT_CONAFF
+        geom.group = 3  # collision primitives: hidden by default, the meshes are the visuals
         body = geom.parent.name
         if body.endswith("_wheel_link") and "caster" not in body:
             geom.friction = [1.2, 0.01, 0.001]
@@ -185,6 +256,7 @@ def edit_spec(spec: mujoco.MjSpec) -> None:
         body.add_site(name=f"{role}_camera", size=[0.005, 0, 0], group=4)
 
     for side in SIDES:
+        _finger_geoms(spec, side)
         spec.body(f"{side}_gripper_tcp_link").add_site(name=f"{side}_tcp", size=[0.008, 0, 0],
                                                         rgba=[1, 0.3, 0.1, 0.6], group=4)
     spec.body("imu_link").add_site(name="imu", size=[0.004, 0, 0], group=4)

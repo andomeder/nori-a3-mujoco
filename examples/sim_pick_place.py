@@ -1,94 +1,131 @@
-# The SDK example examples/mock_pick_place.py, unchanged except for the two marked lines
-# (the import and the session constructor). Run: MUJOCO_GL=egl python examples/sim_pick_place.py
-"""A first task against the mock robot: no hardware, no network, no credentials.
+"""Pick-and-place in the MuJoCo sim, through the Nori SDK session API.
 
-    python examples/mock_pick_place.py
+    python examples/sim_pick_place.py
+    python examples/sim_pick_place.py --record ../demo.mp4 --stills ../stills
 
-Needs nothing installed beyond the package itself -- not even the `webrtc` extra, because
-there is no peer connection here.
+Same shape as the SDK's mock_pick_place.py (discover the robot, drive, use a gripper,
+record an episode, stop safely), but the task is real here: find the red cube with the
+overhead camera, drive until it is in reach, pick it up with the left claw, carry it to the
+green marker, put it down, back off, estop. Everything goes over SDK calls -- jog, snapshot,
+pose (on-board IK), action -- so the logic is hardware-shaped; only calibration (grasp point,
+table height, camera extrinsics) is sim-specific.
 
-The task: discover what robot we're attached to, drive the base, close a gripper to an
-absolute target, record the whole thing as an episode, then stop safely. Every line of it
-runs unchanged against a real robot; the only difference is which context manager opens the
-session. Swap the marked line and this is a production script.
-
-What the mock does NOT prove: ICE, TURN, bandwidth, video, or real timing. A green run here
-means the LOGIC is right.
+(The SDK example itself, with only the session line swapped, is sdk_mock_pick_place.py.)
 """
 
+from __future__ import annotations
+
+import argparse
 import asyncio
+import sys
 
-from nori_a3_mujoco import MujocoRobot, mujoco_session  # <- changed
-from nori_sdk.motion import JogBuilder, joints_by_group
+from nori_a3_mujoco import MujocoRobot, mujoco_session
+from nori_a3_mujoco.perception import SceneLocator
+from nori_a3_mujoco.pick_place import (LIFT_MM, drive_to_standoff, locate, move_lift,
+                                       pick_and_place)
+
+CAPTIONS = {
+    "open": "open the claw", "ready": "arm to ready, above the table",
+    "pregrasp": "pre-grasp: behind the cube", "approach": "approach: cube into the jaw",
+    "grasp": "close: grasp the cube", "lift": "lift the cube clear of the table",
+    "carry": "carry to the green marker", "lower": "lower onto the table",
+    "release": "release", "retreat": "back the claw off", "clear": "arm clear",
+}
 
 
-async def main() -> None:
-    # --- swap these two lines for hardware -------------------------------------------------
-    # from nori_sdk import RemoteTeleop, SupabaseSignaling, UserAuth
-    # auth = UserAuth.from_env().require()
-    # signaling = SupabaseSignaling(url, anon_key, room="NORI-A3-0001", token_provider=auth.token)
-    # async with RemoteTeleop(signaling) as robot:
-    async with mujoco_session(MujocoRobot()) as robot:  # <- changed
-        # 1. WHAT AM I ATTACHED TO? Always first. Never hard-code a joint list: the same
-        #    script has to work on a 5-DOF arm and a 7-DOF one, and the robot is the
-        #    authority on which it is.
-        info = await robot.wait_ready()
-        groups = joints_by_group(info.descriptor)
-        print(f"protocol v{info.protocol_version}, units={info.norm_mode}")
-        for group, dofs in groups.items():
-            print(f"  {group}: {', '.join(dofs)}")
+async def run(robot, bot: MujocoRobot | None = None, say=print) -> bool:
+    info = await robot.wait_ready()
+    say(f"connected: {info.descriptor.joints[:2]}... (+{len(info.descriptor.joints) - 2} more)")
+    locator = SceneLocator("overhead")
+    # With a recorder attached the sim runs 10-15x slower than wall time, so time the guards
+    # on the sim clock and give pose()/action() waits (wall-clock in the SDK) plenty of slack.
+    clock = (lambda: bot.sim_time) if bot is not None else None
+    wait_s = 600.0 if bot is not None else 60.0
 
-        # 2. IS MOTION ACTUALLY LIVE? The peer connection can be perfect while the motion
-        #    stack is down, and in that state the robot DROPS control frames silently. A
-        #    script that skips this check looks like a robot ignoring it, with no error.
-        status = robot.daemon_status
-        if status is not None and not status.online:
-            print(f"motion offline ({status.reason}) -- nothing would move")
-            return
+    say("lift to table height")
+    lift = await move_lift(robot, info.descriptor, LIFT_MM, clock=clock)
+    say(f"lift at {lift:.0f} mm")
 
-        # 3. DRIVE THE BASE. jog() streams at 20 Hz for the duration and then sends an
-        #    explicit zero. That matters: the robot's watchdog treats SILENCE as an absent
-        #    operator, so a jog stream that stops IS a stop command. The keys are
-        #    linear/angular -- NOT the x.vel/theta.vel the descriptor lists, which are the
-        #    telemetry namespace and would read as a full stop.
-        await robot.jog(JogBuilder(info.descriptor).base(linear=0.4).build(), duration=1.0)
-        print(f"after driving: {robot.telemetry.state.get('x.vel')} forward")
+    say("look for the cube and drive up to it")
+    cube = await drive_to_standoff(robot, info.descriptor, locator, clock=clock)
+    if cube is None:
+        say("no cube in view")
+        return False
+    place = await locate(robot, locator, what="marker")
+    if place is None:
+        say("no place marker in view")
+        return False
+    say(f"cube at {cube.round(3).tolist()}, marker at {place.round(3).tolist()} (base_footprint)")
 
-        # 4. AN ABSOLUTE MOVE, and wait for the real verdict. wait=True returns only on a
-        #    TERMINAL state -- "accepted" just means the robot took the target. `clamped`
-        #    means it finished somewhere other than asked, so check .succeeded, not .done.
-        side = "left_arm" if "left_arm" in groups else next(iter(groups), None)
-        if side and "gripper" in groups.get(side, []):
-            result = await robot.action({f"{side}_gripper.pos": 30.0}, wait=True)
-            print(f"gripper -> 30: {result.state} (reached={result.succeeded})")
+    await robot.record("session_start")
+    await robot.record("episode_start", task="pick the red cube, place it on the marker")
+    report = await pick_and_place(robot, cube, place,
+                                  on_step=lambda s: say(CAPTIONS.get(s.name, s.name)),
+                                  timeout=wait_s)
+    await robot.record("episode_stop")
+    await robot.record("session_end")
+    say(f"pick-and-place: {report}")
 
-        # 5. RECORD AN EPISODE. session_start opens the dataset, episode_start begins a take.
-        #    Note episode_discard deletes it from disk -- it is not an undo.
-        await robot.record("session_start")
-        episode = await robot.record("episode_start", task="demo pick")
-        print(f"recording {episode.episode}, {episode.free_gb} GB free")
+    if bot is not None:
+        z = float(bot.data.body("cube").xpos[2])
+        mk = bot.data.geom("place_marker").xpos
+        off = float(((bot.data.body("cube").xpos[:2] - mk[:2]) ** 2).sum() ** 0.5)
+        say(f"sim check: cube z={z:.3f} m, {off * 1000:.0f} mm from the marker centre")
 
-        if side:
-            for dof in groups[side][:1]:
-                await robot.jog(
-                    JogBuilder(info.descriptor).arm(side, dof, 0.5).build(), duration=0.5
-                )
+    say("estop")
+    robot.estop()
+    await asyncio.sleep(0.3)
+    print(f"estopped -- latched={robot.telemetry.safety}")
+    return report.ok
 
-        stopped = await robot.record("episode_stop")
-        print(f"kept {stopped.episodes_kept} episode(s)")
-        await robot.record("session_end")
 
-        # 6. READ THE STREAM. Same API shape as any other frame kind.
-        async for telemetry in robot.stream("telemetry"):
-            moved = {k: round(v, 1) for k, v in telemetry.state.items() if abs(v) > 0.01}
-            print(f"safety={telemetry.safety} moved={moved}")
-            break
+async def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--record", help="write an mp4 of the run here")
+    ap.add_argument("--stills", help="with --record: directory for PNG stills")
+    args = ap.parse_args()
 
-        # 7. STOP. estop() latches: motion stays blocked until reset_latch(). It is
-        #    deliberately synchronous and un-awaited so it can never queue behind anything.
-        robot.estop()
-        print("estopped -- latched until reset_latch()")
+    bot = MujocoRobot()
+    recorder = None
+    if args.record:
+        from nori_a3_mujoco.record import VideoRecorder
+
+        recorder = VideoRecorder(bot, fps=30)
+
+    marks: dict[str, int] = {}
+
+    def say(text: str) -> None:
+        print(text)
+        if recorder is not None:
+            recorder.caption = text
+            marks.setdefault(text, len(recorder.frames))
+
+    async with mujoco_session(bot) as robot:
+        ok = await run(robot, bot, say)
+
+    if recorder is not None:
+        stills = None
+        if args.stills:
+            from pathlib import Path
+
+            names = [("lift to table height", "01_start"),
+                     ("look for the cube and drive up to it", "02_drive"),
+                     (CAPTIONS["approach"], "03_approach"), (CAPTIONS["grasp"], "04_grasp"),
+                     (CAPTIONS["lift"], "05_lifted"), (CAPTIONS["carry"], "06_carry"),
+                     (CAPTIONS["release"], "07_placed"), (CAPTIONS["clear"], "08_clear")]
+            order = sorted(marks.values()) + [len(recorder.frames)]
+            stills = {}
+            for caption, name in names:
+                if caption in marks:
+                    start = marks[caption]
+                    nxt = min([i for i in order if i > start] or [start + 1])
+                    stills[str(Path(args.stills) / f"{name}.png")] = (start + nxt) // 2 \
+                        if name not in ("01_start",) else start + 2
+        path = recorder.save(args.record, stills)
+        print(f"wrote {path} ({len(recorder.frames)} frames)")
+        recorder.close()
+    return 0 if ok else 1
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    sys.exit(asyncio.run(main()))
