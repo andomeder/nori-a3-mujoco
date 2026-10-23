@@ -9,9 +9,6 @@ Same order and shape as the GPU helpers in andomeder/act-mujoco-manipulation
 
 Override with NORI_DEVICE=auto|cpu|xpu|xpu:1|cuda. Nothing here imports torch at module import,
 so the sim and policy runner work without it.
-
-Intel Extension for PyTorch (IPEX) is optional: set NORI_IPEX=1 and, if it imports, models
-are passed through ipex.optimize(). Native torch.xpu does not need it.
 """
 
 from __future__ import annotations
@@ -54,18 +51,6 @@ def synchronize(device: Any) -> None:
         torch.xpu.synchronize()
     elif kind == "cuda":
         torch.cuda.synchronize()
-
-
-def maybe_ipex_optimize(model: Any, device: Any, dtype: Any = None) -> Any:
-    """ipex.optimize(model) when NORI_IPEX=1, the device is XPU and IPEX imports; else model."""
-    if os.environ.get("NORI_IPEX") != "1" or getattr(device, "type", "") != "xpu":
-        return model
-    try:
-        import intel_extension_for_pytorch as ipex  # type: ignore
-    except Exception as exc:  # pragma: no cover - optional
-        log.warning("NORI_IPEX=1 but IPEX failed to import (%s); continuing without it", exc)
-        return model
-    return ipex.optimize(model.eval(), dtype=dtype) if dtype else ipex.optimize(model.eval())
 
 
 def onnx_providers() -> list[Any]:

@@ -60,7 +60,7 @@ class ChunkedTorchPolicy:
         self.torch = torch
         self.device = device if device is not None else devices.torch_device()
         self.dtype = dtype or torch.float32
-        self.model = devices.maybe_ipex_optimize(model.to(self.device).eval(), self.device)
+        self.model = model.to(self.device).eval()
         self.joint_keys = list(joint_keys)
         self.state_keys = list(state_keys or joint_keys)
         self.cameras = list(cameras)
