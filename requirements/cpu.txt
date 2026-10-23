@@ -64,7 +64,7 @@ setuptools==84.2.1 ; python_full_version >= '3.12'
     # via torch
 sympy==1.14.0
     # via torch
-torch==2.9.1 ; sys_platform == 'darwin'
+torch==2.13.0 ; sys_platform == 'darwin'
     # via nori-a3-mujoco
 torch==2.9.1+cpu ; sys_platform != 'darwin'
     # via nori-a3-mujoco
